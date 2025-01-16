@@ -1,0 +1,300 @@
+package main
+
+import (
+	"database/sql"
+	_ "github.com/mattn/go-sqlite3" // <-- это драйвер для SQLite
+	"log"
+	"os"
+	"strconv"
+	"strings"
+
+	tgbotapi "github.com/crocone/tg-bot"
+	"github.com/joho/godotenv"
+)
+
+var bot *tgbotapi.BotAPI
+var db *sql.DB
+
+var userState = make(map[int64]string)
+
+type button struct {
+	name string
+	data string
+}
+
+func startMenu() tgbotapi.InlineKeyboardMarkup {
+	states := []button{
+		{name: "Привет", data: "hi"},
+		{name: "Пока", data: "buy"},
+		{name: "О чем бот?", data: "help"},
+		{name: "Счёт", data: "calc"},
+		{name: "тренировке", data: "traine"},
+	}
+
+	var buttons [][]tgbotapi.InlineKeyboardButton
+	for _, st := range states {
+		row := tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(st.name, st.data),
+		)
+		buttons = append(buttons, row)
+	}
+	return tgbotapi.NewInlineKeyboardMarkup(buttons...)
+}
+
+func helpMenu() tgbotapi.InlineKeyboardMarkup {
+	states := []button{
+		{name: "Назад", data: "exit"},
+		{name: "Доп. помощь", data: "helpe"},
+	}
+
+	var buttons [][]tgbotapi.InlineKeyboardButton
+	for _, st := range states {
+		row := tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(st.name, st.data),
+		)
+		buttons = append(buttons, row)
+	}
+	return tgbotapi.NewInlineKeyboardMarkup(buttons...)
+}
+func traineMenu() tgbotapi.InlineKeyboardMarkup {
+	states := []button{
+		{name: "Тренировка:легкий уровень", data: "Light"},
+		{name: "Тренировка:средний уровень", data: "Midle"},
+		{name: "Тренировка:сложный уровень", data: "Hard"},
+		{name: "Назад", data: "back"},
+	}
+	var buttons [][]tgbotapi.InlineKeyboardButton
+	for _, st := range states {
+		row := tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(st.name, st.data),
+		)
+		buttons = append(buttons, row)
+	}
+	return tgbotapi.NewInlineKeyboardMarkup(buttons...)
+
+}
+
+func initDB() {
+	var err error
+	db, err = sql.Open("sqlite3", "./bot.db")
+	if err != nil {
+		log.Fatalf("Failed to open DB: %v", err)
+	}
+
+	createTableQuery := `
+    CREATE TABLE IF NOT EXISTS user_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        numbers TEXT
+    );
+    `
+	_, err = db.Exec(createTableQuery)
+	if err != nil {
+		log.Fatalf("Failed to create table: %v", err)
+	}
+}
+
+// Сохраняет введённые числа в БД
+func SaveNumbers(chatID int64, numbers string) error {
+	query := `INSERT INTO user_data (chat_id, numbers) VALUES (?, ?)`
+	_, err := db.Exec(query, chatID, numbers)
+	return err
+}
+
+// Получает все введённые строки чисел для данного chatID
+func getNumbersByChatID(chatID int64) ([]string, error) {
+	query := `SELECT numbers FROM user_data WHERE chat_id = ?`
+	rows, err := db.Query(query, chatID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []string
+	for rows.Next() {
+		var nums string
+		if err := rows.Scan(&nums); err != nil {
+			return nil, err
+		}
+		result = append(result, nums)
+	}
+	return result, nil
+}
+
+func main() {
+	err := godotenv.Load(".env")
+	if err != nil {
+		log.Println(".env not loaded (it's okay if you have token in another place)")
+	}
+
+	bot, err = tgbotapi.NewBotAPI(os.Getenv("TG_API_BOT_TOKEN"))
+	if err != nil {
+		log.Fatalf("Failed to initialize Telegram bot API: %v", err)
+	}
+
+	initDB()
+	defer db.Close()
+
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = 60
+	updates := bot.GetUpdatesChan(u)
+
+	for update := range updates {
+		if update.CallbackQuery != nil {
+			callbacks(update)
+		} else if update.Message != nil {
+			if update.Message.IsCommand() {
+				commands(update)
+			} else {
+				handleUserText(update)
+			}
+		}
+	}
+}
+
+func callbacks(update tgbotapi.Update) {
+	data := update.CallbackQuery.Data
+	chatID := update.CallbackQuery.Message.Chat.ID
+	messageID := update.CallbackQuery.Message.MessageID
+
+	switch data {
+	case "hi":
+		del := tgbotapi.NewDeleteMessage(chatID, messageID)
+		bot.Send(del)
+		sendText(chatID, "Привет!")
+
+	case "buy":
+		del := tgbotapi.NewDeleteMessage(chatID, messageID)
+		bot.Send(del)
+		sendText(chatID, "Пока!")
+
+	case "help":
+		newMenu := helpMenu()
+		edit := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, newMenu)
+		bot.Send(edit)
+
+	case "exit":
+		newMenu := startMenu()
+		edit := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, newMenu)
+		bot.Send(edit)
+
+	case "helpe":
+		del := tgbotapi.NewDeleteMessage(chatID, messageID)
+		bot.Send(del)
+		sendText(chatID, "Дополнительная помощь недоступна в данный момент.")
+
+	case "calc":
+		del := tgbotapi.NewDeleteMessage(chatID, messageID)
+		bot.Send(del)
+		userState[chatID] = "WAITING_NUMBERS"
+		sendText(chatID, "Введите числа через пробел, я их сложу:")
+
+	case "traine":
+		//вот  прмиер как создать меню с кнопками
+		del := tgbotapi.NewDeleteMessage(chatID, messageID)
+		bot.Send(del)
+
+		// Создаём новое сообщение с текстом и прикрепляем меню тренировок
+		msg := tgbotapi.NewMessage(chatID, "Это список тренировок по уровням:")
+		msg.ReplyMarkup = traineMenu()
+		bot.Send(msg)
+	case "back":
+		newMenu := startMenu()
+		edit := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, newMenu)
+		bot.Send(edit)
+
+	case "Light":
+		del := tgbotapi.NewDeleteMessage(chatID, messageID)
+		bot.Send(del)
+
+		sendText(chatID, "Вот списко тренировок легких тринировок")
+
+	default:
+		sendText(chatID, "Неизвестная команда")
+	}
+}
+
+func commands(update tgbotapi.Update) {
+	chatID := update.Message.Chat.ID
+
+	switch update.Message.Command() {
+	case "start":
+		msg := tgbotapi.NewMessage(chatID, "Выберите действие")
+		msg.ReplyMarkup = startMenu()
+		sendMessage(msg)
+
+	case "help":
+		msg := tgbotapi.NewMessage(chatID, "Выберите действие:")
+		msg.ReplyMarkup = helpMenu()
+		sendMessage(msg)
+
+	case "train":
+		msg := tgbotapi.NewMessage(chatID, "Это список тренировок по уровню сложности")
+		msg.ReplyMarkup = traineMenu()
+		sendMessage(msg)
+
+	case "history":
+		entries, err := getNumbersByChatID(chatID)
+		if err != nil {
+			sendText(chatID, "Ошибка при чтении истории: "+err.Error())
+			return
+		}
+
+		if len(entries) == 0 {
+			sendText(chatID, "История пуста!")
+			return
+		}
+
+		historyText := strings.Join(entries, "\n")
+		sendText(chatID, "Ваша история чисел:\n"+historyText)
+	}
+}
+
+func handleUserText(update tgbotapi.Update) {
+	chatID := update.Message.Chat.ID
+	userText := update.Message.Text
+
+	if userState[chatID] == "WAITING_NUMBERS" {
+		sum, ok := sumNumbers(userText)
+		if !ok {
+			sendText(chatID, "Не удалось распознать числа. Введите ещё раз:")
+			return
+		}
+		if err := SaveNumbers(chatID, userText); err != nil {
+			log.Printf("Ошибка при сохранении в БД: %v", err)
+		}
+		sendText(chatID, "Сумма: "+strconv.Itoa(sum))
+		userState[chatID] = ""
+	} else {
+		reply := "Вы ввели: " + userText
+		sendText(chatID, reply)
+	}
+}
+
+func sumNumbers(input string) (int, bool) {
+	input = strings.ReplaceAll(input, ",", " ")
+	parts := strings.Fields(input)
+	if len(parts) == 0 {
+		return 0, false
+	}
+	sum := 0
+	for _, p := range parts {
+		num, err := strconv.Atoi(p)
+		if err != nil {
+			return 0, false
+		}
+		sum += num
+	}
+	return sum, true
+}
+
+func sendText(chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	sendMessage(msg)
+}
+
+func sendMessage(msg tgbotapi.Chattable) {
+	if _, err := bot.Send(msg); err != nil {
+		log.Printf("Failed to send message: %v", err)
+	}
+}
